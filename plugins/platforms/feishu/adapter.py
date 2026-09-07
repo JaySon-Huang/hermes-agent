@@ -164,6 +164,22 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "once": "Approved once", "session": "Approved for session", "always": "Approved permanently", "deny": "Denied",
 }
 
+# Model-menu NAVIGATION card actions handled synchronously in the card flow:
+# each returns a P2CardActionTriggerResponse that swaps the card in place.
+# ``model_choose`` sends a NEW card (first hop off the main menu; nothing to
+# update). ``model_select`` is deliberately NOT here: switching the model must
+# go through the agent pipeline (the /model command applies it to the live
+# agent and persists it), so it is routed as a synthetic command further down.
+_MODEL_CARD_ACTIONS: frozenset = frozenset({
+    "model_choose",
+    "model_provider",
+    "model_provider_back",
+})
+# How long the Feishu card-action SDK callback may block while a model query /
+# switch runs (the button spins during this window). Generous enough for a
+# cold models.dev fetch inside switch_model(); usually completes in seconds.
+_MODEL_CARD_ACTION_TIMEOUT_SECONDS: float = 45.0
+
 
 async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
     """Read at most ``max_bytes`` from an aiohttp request body."""
@@ -311,6 +327,7 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
+    feishu_menu: List[FeishuMenuItem] = field(default_factory=list)
 
 
 @dataclass
@@ -321,6 +338,35 @@ class FeishuGroupRule:
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
     require_mention: Optional[bool] = None  # None = inherit global
+
+
+@dataclass
+class FeishuMenuItem:
+    """A single interactive-card menu entry.
+
+    ``action`` is the machine value carried in the button's ``value`` dict
+    (``{'action': <action>}``) and routed by ``_handle_card_action_event``.
+    ``label`` is the button text shown to the user (defaults to ``action``).
+    ``type`` is one of ``primary`` | ``default`` | ``danger``; unknown values
+    fall back to ``default``.
+    """
+
+    action: str
+    label: str = ""
+    type: str = "default"
+
+
+# Default Feishu menu items used when none are configured via config.yaml
+# (``platforms.feishu.extra.feishu_menu``). Labels match the existing card
+# template; each ``action`` maps to an agent-handleable command in
+# ``_handle_card_action_event``.
+DEFAULT_FEISHU_MENU: List[FeishuMenuItem] = [
+    FeishuMenuItem(action="new", label="🆕 新会话", type="default"),
+    FeishuMenuItem(action="status", label="📟 会话状态", type="primary"),
+    FeishuMenuItem(action="usage", label="📊 用量", type="default"),
+    FeishuMenuItem(action="context", label="🧩 上下文", type="default"),
+    FeishuMenuItem(action="model_choose", label="🔧 切换模型", type="default"),
+]
 
 
 @dataclass
@@ -356,6 +402,36 @@ def _escape_markdown_text(text: str) -> str:
 
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
+
+
+def _parse_feishu_menu_items(raw: Any) -> List[FeishuMenuItem]:
+    """Parse a config-driven list of Feishu menu items into FeishuMenuItem objects.
+
+    Accepts ``None`` (falls back to DEFAULT_FEISHU_MENU), a list of dicts, or an
+    existing list of FeishuMenuItem. Each item must carry a non-empty ``action``
+    (the machine value routed by _handle_card_action_event); ``label`` defaults
+    to ``action`` and ``type`` is normalized to "primary" | "default" | "danger"
+    (unknown values fall back to "default").
+    """
+    if raw is None:
+        return list(DEFAULT_FEISHU_MENU)
+    if isinstance(raw, list) and raw and all(isinstance(item, FeishuMenuItem) for item in raw):
+        return raw
+    if not isinstance(raw, list):
+        return list(DEFAULT_FEISHU_MENU)
+    menu: List[FeishuMenuItem] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        if not action:
+            continue
+        label = str(item.get("label") or action)
+        btn_type = str(item.get("type") or "default").strip().lower()
+        if btn_type not in {"primary", "default", "danger"}:
+            btn_type = "default"
+        menu.append(FeishuMenuItem(action=action, label=label, type=btn_type))
+    return menu or list(DEFAULT_FEISHU_MENU)
 
 
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
@@ -1326,6 +1402,7 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            feishu_menu=_parse_feishu_menu_items(extra.get("feishu_menu")),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1692,6 +1769,100 @@ class FeishuAdapter(BasePlatformAdapter):
                 "chat_id": chat_id,
             }
         return result
+
+    async def send_menu_card(self, chat_id: str, menu_items=None, thread_id: Optional[str] = None) -> None:
+        """Send the interactive button menu card to a Feishu chat.
+
+        Builds the card dynamically from ``menu_items`` (a list of
+        ``FeishuMenuItem`` or dicts with action/label/type) or the config-driven
+        ``feishu_menu`` default when ``menu_items`` is None. Buttons are grouped
+        two-per-row (layout 'bisect') and carry ``value={'action': <action>}`` so
+        ``_handle_card_action_event`` routes each click to its mapped command.
+        The card keeps ``config.update_multi: true`` so a click updates it in
+        place.
+
+        ``thread_id`` routes the card into a Feishu topic (forum thread) instead
+        of the top-level chat — pass the source thread_id when the /menu command
+        was issued inside a topic, so the card does not spawn a new topic.
+        """
+        if not self._client:
+            return
+        items = _parse_feishu_menu_items(
+            menu_items if menu_items is not None else self._settings.feishu_menu
+        )
+
+        def _btn(item: FeishuMenuItem) -> dict:
+            value = {"action": item.action}
+            # Carry the topic id through button values so follow-up cards
+            # (provider/model/result) stay inside the same Feishu topic.
+            if thread_id:
+                value["thread_id"] = thread_id
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": item.label or item.action},
+                "type": item.type or "default",
+                "value": value,
+            }
+
+        buttons = [_btn(item) for item in items]
+        # Feishu 'bisect' layout nests exactly two buttons per action row.
+        elements: List[Dict[str, Any]] = [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "点按钮即执行对应指令（当前会话）。"},
+            },
+            {"tag": "hr"},
+        ]
+        for i in range(0, len(buttons), 2):
+            elements.append({
+                "tag": "action",
+                "layout": "bisect",
+                "actions": buttons[i:i + 2],
+            })
+
+        card = {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"content": "🤖 Hermes 指令菜单", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        # Topic routing: receive_id_type="thread_id" on message.create is rejected
+        # with 99992402. The reliable way to land inside a topic is to REPLY to a
+        # message in that thread (message.reply with reply_in_thread=True). Fetch
+        # the thread's last message as the reply anchor; fall back to top-level
+        # chat_id if none is found.
+        reply_to = None
+        metadata = None
+        if thread_id:
+            anchor = await self._fetch_last_message_in_thread(thread_id)
+            if anchor:
+                reply_to = anchor
+                metadata = {"thread_id": thread_id}
+            else:
+                logger.warning(
+                    "[Feishu] /menu: no anchor message found in thread %s; posting to top-level chat",
+                    thread_id,
+                )
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] send_menu_card failed for chat %s: %s", chat_id, exc)
+            return
+        if not self._response_succeeded(response):
+            logger.warning(
+                "[Feishu] send_menu_card returned non-success for chat %s (code %s): %s",
+                chat_id,
+                getattr(response, "code", "unknown"),
+                getattr(response, "msg", "unknown"),
+            )
 
     @staticmethod
     def _build_update_prompt_card(*, prompt: str, default: str, prompt_id: int) -> Dict[str, Any]:
@@ -2076,6 +2247,11 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         if isinstance(action_value, dict):
+            # Model menu actions update the card in place, so the card response
+            # must be returned synchronously from the callback. Run the async
+            # handler on the loop and wait for its card response.
+            if action_value.get("action") in _MODEL_CARD_ACTIONS:
+                return self._run_model_card_action_sync(data, loop)
             if action_value.get("hermes_action"):
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
             if action_value.get("hermes_update_prompt_action"):
@@ -2111,15 +2287,21 @@ class FeishuAdapter(BasePlatformAdapter):
         return "*" in allowed_ids or normalized in allowed_ids
 
     @staticmethod
-    def _card_response(card_data: Optional[Dict[str, Any]] = None) -> Any:
-        """Synchronous card-callback response; ``card_data`` updates the card inline."""
+    def _card_response(card_data: Any = None) -> Any:
+        """Synchronous card-callback response; ``card_data`` updates the card inline.
+
+        Feishu only honors an in-place interactive-card swap through
+        ``P2CardActionTriggerResponse.card`` (the ``im/v1/message/{id}`` PUT
+        path rejects ``msg_type=interactive`` with 230001). ``card.data`` must
+        be a JSON *string*; dicts are serialized here, strings pass through.
+        """
         if P2CardActionTriggerResponse is None:
             return None
         response = P2CardActionTriggerResponse()
         if card_data is not None and CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = card_data
+            card.data = card_data if isinstance(card_data, str) else json.dumps(card_data, ensure_ascii=False)
             response.card = card
         return response
 
@@ -2319,8 +2501,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self._card_action_tokens[token] = now
         return False
 
-    async def _handle_card_action_event(self, data: Any) -> None:
-        """Route Feishu interactive card button clicks as synthetic COMMAND events."""
+    async def _handle_card_action_event(self, data: Any) -> Any:
+        """Route Feishu interactive card button clicks as synthetic COMMAND events.
+
+        Returns a ``P2CardActionTriggerResponse`` for model-menu actions (which
+        swap the card in place); otherwise routes the click as a synthetic
+        command and returns ``None`` (the caller sends an empty response).
+        """
         event = getattr(data, "event", None)
         token = str(getattr(event, "token", "") or "")
         if token and self._is_card_action_duplicate(token):
@@ -2336,22 +2523,82 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_tag = str(getattr(action, "tag", "") or "button")
         action_value = getattr(action, "value", {}) or {}
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
-            try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
+
+        # Model-select card menu actions are self-contained: the flow lives in
+        # the card and never synthesizes a command. Each returns the
+        # updated card as the callback response so Feishu replaces the current
+        # card in place (the only mechanism that works for interactive swaps).
+        _model_action = action_value.get("action") if isinstance(action_value, dict) else None
+        if _model_action in _MODEL_CARD_ACTIONS:
+            return await self._handle_model_menu_action(
+                _model_action,
+                action_value=action_value,
+                chat_id=chat_id,
+            )
+
+        # Translate a card button's machine action (e.g. value={"action": "status"})
+        # into agent-handleable instruction text.  Menu cards use
+        # value={"action": "..."} (or {"hermes_action": "..."}); approval and
+        # update-prompt cards are already routed earlier in
+        # _on_card_action_trigger and never reach this branch.
+        _ACTION_MAP = {
+            "new": "/new",
+            "status": "/status",
+            "usage": "/usage",
+            "context": "/context",
+            "model": "/model",
+        }
+        # The card's originating topic id (stamped into button values by the
+        # senders) so the synthetic command's replies land in the same topic.
+        _thread_id = action_value.get("thread_id") if isinstance(action_value, dict) else None
+        if action_value and isinstance(action_value, dict):
+            _a = action_value.get("action") or action_value.get("hermes_action")
+            if _a == "model_select":
+                # Switching a model must go through the agent pipeline (/model):
+                # only the gateway's /model handler applies the switch to the
+                # live agent and persists it. Synthesize that slash command.
+                # Use `--provider <slug> <model>` (NOT `<slug>/<model>`): the
+                # picker lists models by their bare id (e.g. "kimi-k3"), and
+                # switch_model resolves the bare id against the named provider.
+                # A "<slug>/<model>" string is treated as one model name and
+                # fails (e.g. "copilot/kimi-k3" not found; "kimi-k3" is).
+                _provider = str(action_value.get("provider", "") or "").strip()
+                _model = str(action_value.get("model", "") or "").strip()
+                if _provider and _model:
+                    synthetic_text = f"/model --provider {_provider} {_model}"
+                elif _model:
+                    synthetic_text = f"/model {_model}"
+                else:
+                    synthetic_text = "/model"
+            elif _a and _a in _ACTION_MAP:
+                synthetic_text = _ACTION_MAP[_a]
+            else:
+                # Unknown action: pass the raw value through for troubleshooting.
+                try:
+                    synthetic_text = f"/card {action_tag} {json.dumps(action_value, ensure_ascii=False)}"
+                except Exception:
+                    synthetic_text = f"/card {action_tag}"
+        else:
+            synthetic_text = f"/card {action_tag}"
+
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
+        # Card action callbacks carry the originating card's real message id in
+        # event.context.open_message_id (CallBackContext). Using the card-action
+        # token here makes the agent reply to a non-existent message id and
+        # Feishu rejects it (99992354). Prefer the real open_message_id so the
+        # reply lands on the card's thread; fall back to the token only if absent.
+        _ctx = getattr(event, "context", None)
+        _real_msg_id = getattr(_ctx, "open_message_id", None) or ""
         await self._dispatch_synthetic_event(
             text=synthetic_text, message_type=MessageType.COMMAND, chat_id=chat_id,
             sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None), event_chat_type="group",
-            raw_message=data, message_id=token or str(uuid.uuid4()),
+            raw_message=data, message_id=_real_msg_id or token or str(uuid.uuid4()),
+            thread_id=_thread_id,
         )
 
     async def _dispatch_synthetic_event(
         self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
-        raw_message: Any, message_id: str,
+        raw_message: Any, message_id: str, thread_id: Optional[str] = None,
     ) -> None:
         """Wrap a reaction/card click as a MessageEvent and run it through the guarded pipeline."""
         sender_profile = await self._resolve_sender_profile(sender_id)
@@ -2362,7 +2609,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
         )
         synthetic_event = MessageEvent(
@@ -2372,7 +2619,369 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         await self._handle_message_with_guards(synthetic_event)
 
-    # --- Per-chat serialization and typing indicator ---
+    # =========================================================================
+    # Model-menu card actions (provider / model selection cards)
+    # =========================================================================
+
+    # ``_card_response`` and the ``_build_*_card`` helpers assemble the
+    # interactive cards that drive the three-tier model-select menu.  All
+    # updates use ``config.update_multi: true`` so Feishu swaps the card in
+    # place, and every button value carries ``{"action": ...}`` plus any
+    # provider / model context the next hop needs.
+
+    @staticmethod
+    def _build_provider_card(providers: List[Dict[str, Any]], thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build the provider-selection card for the model menu.
+
+        Each provider is a button whose value carries ``action: model_provider``
+        plus the provider slug, so clicking it queries that provider's models.
+        When ``thread_id`` is set, it is stamped into each button value so the
+        next hop (model-list card) stays inside the same Feishu topic.
+        """
+        def _btn(provider: Dict[str, Any]) -> dict:
+            slug = str(provider.get("slug", ""))
+            label = str(provider.get("name") or slug)
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": "default",
+                "value": {"action": "model_provider", "provider": slug, **({"thread_id": thread_id} if thread_id else {})},
+            }
+
+        buttons = [_btn(p) for p in (providers or []) if p.get("slug")]
+        elements: List[Dict[str, Any]] = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": "选择 provider 以列出模型："}},
+        ]
+        if buttons:
+            elements.append({"tag": "hr"})
+            for i in range(0, len(buttons), 2):
+                elements.append({
+                    "tag": "action",
+                    "layout": "bisect",
+                    "actions": buttons[i:i + 2],
+                })
+        else:
+            elements.append({"tag": "markdown", "content": "没有可用的已认证 provider。"})
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"title": {"content": "🔧 选择 Provider", "tag": "plain_text"}, "template": "blue"},
+            "elements": elements,
+        }
+
+    @staticmethod
+    def _build_model_list_card(provider: str, models: List[str], thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build the model-list card for a selected provider.
+
+        Each model is a button whose value carries ``action: model_select``
+        plus the provider slug and model id. A trailing "← 选择其他 provider"
+        button returns to the provider-selection card. When ``thread_id`` is
+        set, it is stamped into every button value so the next hop stays
+        inside the same Feishu topic.
+        """
+        def _btn(model: str) -> dict:
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": model},
+                "type": "default",
+                "value": {"action": "model_select", "provider": provider, "model": model, **({"thread_id": thread_id} if thread_id else {})},
+            }
+
+        buttons = [_btn(m) for m in (models or []) if m]
+        elements: List[Dict[str, Any]] = [
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"Provider：**{provider}** — 选择模型："}},
+        ]
+        if buttons:
+            elements.append({"tag": "hr"})
+            for i in range(0, len(buttons), 2):
+                elements.append({
+                    "tag": "action",
+                    "layout": "bisect",
+                    "actions": buttons[i:i + 2],
+                })
+        else:
+            elements.append({"tag": "markdown", "content": "该 provider 暂无可用模型。"})
+        elements.append({
+            "tag": "action",
+            "actions": [{
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "← 选择其他 provider"},
+                "type": "default",
+                "value": {"action": "model_provider_back", **({"thread_id": thread_id} if thread_id else {})},
+            }],
+        })
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"title": {"content": "🔧 选择模型", "tag": "plain_text"}, "template": "blue"},
+            "elements": elements,
+        }
+
+    @staticmethod
+    def _build_model_card_error(message: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build a model-menu error card with a route back to the provider list.
+
+        The "← 选择其他 provider" back button carries ``thread_id`` when set so
+        the return hop stays inside the same Feishu topic.
+        """
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {"title": {"content": "❌ 查询失败", "tag": "plain_text"}, "template": "red"},
+            "elements": [
+                {"tag": "markdown", "content": f"查询失败，请稍后重试。\n\n{message}"},
+                {"tag": "action", "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "← 选择其他 provider"},
+                    "type": "default",
+                    "value": {"action": "model_provider_back", **({"thread_id": thread_id} if thread_id else {})},
+                }]},
+            ],
+        }
+
+    def _load_model_switch_context(self) -> Dict[str, Any]:
+        """Return the model-switch context the card menu needs.
+
+        Mirrors ``gateway.slash_commands._handle_model_command``: reads the
+        live gateway config for the active model/provider plus the user and
+        custom provider definitions so ``switch_model`` and the provider/model
+        listing resolve exactly as the ``/model`` command does.
+        """
+        current_model = ""
+        current_provider = "openrouter"
+        current_base_url = ""
+        current_api_key = ""
+        user_providers = None
+        custom_providers = None
+        try:
+            from gateway.run import _load_gateway_config
+            cfg = _load_gateway_config()
+            if cfg:
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_model = str(model_cfg.get("default", "") or "")
+                    current_provider = str(model_cfg.get("provider", "") or current_provider)
+                    current_base_url = str(model_cfg.get("base_url", "") or "")
+                user_providers = cfg.get("providers")
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_providers = get_compatible_custom_providers(cfg)
+                except Exception:
+                    custom_providers = cfg.get("custom_providers")
+        except Exception as exc:
+            logger.debug("[Feishu] Could not load model-switch context: %s", exc)
+        return {
+            "current_provider": current_provider,
+            "current_model": current_model,
+            "current_base_url": current_base_url,
+            "current_api_key": current_api_key,
+            "user_providers": user_providers,
+            "custom_providers": custom_providers,
+        }
+
+    def _list_authenticated_providers(self) -> List[Dict[str, Any]]:
+        """Return authenticated-provider rows (same live source as ``/model``)."""
+        ctx = self._load_model_switch_context()
+        try:
+            from hermes_cli.model_switch import list_authenticated_providers
+            return list_authenticated_providers(
+                current_provider=ctx["current_provider"],
+                current_base_url=ctx["current_base_url"],
+                user_providers=ctx["user_providers"],
+                custom_providers=ctx["custom_providers"],
+                current_model=ctx["current_model"],
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] list_authenticated_providers failed: %s", exc)
+            return []
+
+    def _list_models_for_provider(self, provider_slug: str) -> List[str]:
+        """Return the curated model IDs for ``provider_slug`` (``/model`` picker).
+
+        Reuses ``list_picker_providers`` (the interactive-picker variant that
+        filters to callable models) and falls back to the unfiltered
+        ``list_authenticated_providers`` row so custom endpoints without a
+        picker-surfaced set still list their configured models.
+        """
+        ctx = self._load_model_switch_context()
+        normalized = str(provider_slug or "").strip().lower()
+        if not normalized:
+            return []
+
+        def _find(rows: List[Dict[str, Any]]) -> List[str]:
+            for row in rows:
+                if str(row.get("slug", "")).strip().lower() == normalized:
+                    return [m for m in (row.get("models") or []) if m]
+            return []
+
+        try:
+            from hermes_cli.model_switch import list_picker_providers
+            rows = list_picker_providers(
+                current_provider=ctx["current_provider"],
+                current_base_url=ctx["current_base_url"],
+                user_providers=ctx["user_providers"],
+                custom_providers=ctx["custom_providers"],
+                current_model=ctx["current_model"],
+                max_models=50,
+                include_moa=True,
+            )
+            models = _find(rows)
+            if models:
+                return models
+        except Exception as exc:
+            logger.debug("[Feishu] list_picker_providers failed for %s: %s", provider_slug, exc)
+        try:
+            from hermes_cli.model_switch import list_authenticated_providers
+            rows = list_authenticated_providers(
+                current_provider=ctx["current_provider"],
+                current_base_url=ctx["current_base_url"],
+                user_providers=ctx["user_providers"],
+                custom_providers=ctx["custom_providers"],
+                current_model=ctx["current_model"],
+            )
+            return _find(rows)
+        except Exception as exc:
+            logger.debug("[Feishu] list_authenticated_providers fallback failed for %s: %s", provider_slug, exc)
+            return []
+
+    async def _send_provider_card(self, chat_id: str, thread_id: Optional[str] = None) -> None:
+        """Send a NEW provider-selection card (the model menu's first hop)."""
+        if not self._client:
+            return
+        try:
+            providers = await asyncio.to_thread(self._list_authenticated_providers)
+            card = self._build_provider_card(providers, thread_id=thread_id)
+            await self._send_card_payload(chat_id, card, thread_id=thread_id)
+        except Exception as exc:
+            logger.warning("[Feishu] _send_provider_card failed for chat %s: %s", chat_id, exc)
+
+    async def _send_card_payload(self, chat_id: str, card: Dict[str, Any], thread_id: Optional[str] = None) -> None:
+        """Send an interactive card to ``chat_id`` (a NEW message).
+
+        When ``thread_id`` is set, route the card into the Feishu topic by
+        replying to the thread's last message (the same reply-anchor trick used
+        by ``send_menu_card``), and fall back to the top-level chat if no anchor
+        is found. This keeps the whole model-menu chain inside the topic.
+        """
+        if not self._client:
+            return
+        try:
+            reply_to = None
+            metadata = None
+            if thread_id:
+                anchor = await self._fetch_last_message_in_thread(thread_id)
+                if anchor:
+                    reply_to = anchor
+                    metadata = {"thread_id": thread_id}
+                else:
+                    logger.warning(
+                        "[Feishu] _send_card_payload: no anchor message found in thread %s; posting to top-level chat",
+                        thread_id,
+                    )
+            await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] send interactive card failed for chat %s: %s", chat_id, exc)
+
+    def _run_model_card_action_sync(self, data: Any, loop: Any) -> Any:
+        """Run a model-menu card action on the loop and wait for its card response.
+
+        The Feishu SDK callback must return a ``P2CardActionTriggerResponse``
+        synchronously to swap the card in place, so we schedule the async
+        handler and block here until it produces that response (or times out).
+        """
+        from agent.async_utils import safe_schedule_threadsafe
+        future = safe_schedule_threadsafe(
+            self._handle_card_action_event(data),
+            loop,
+            logger=logger,
+            log_message="[Feishu] Failed to schedule model card action",
+            log_level=logging.WARNING,
+        )
+        if future is None:
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        try:
+            result = future.result(timeout=_MODEL_CARD_ACTION_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "[Feishu] Model card action timed out after %.0fs",
+                _MODEL_CARD_ACTION_TIMEOUT_SECONDS,
+            )
+            result = None
+        except Exception as exc:
+            logger.warning("[Feishu] Model card action failed: %s", exc)
+            result = None
+        if result is not None:
+            return result
+        return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+    async def _handle_model_menu_action(self, action: str, *, action_value: Dict[str, Any], chat_id: str) -> Any:
+        """Execute a handled model-menu card action and return its card response."""
+        # The originating button value carries the Feishu topic id when /menu
+        # was issued inside a thread; thread it through every card so the whole
+        # model-selection chain stays inside that topic.
+        thread_id = action_value.get("thread_id")
+
+        if action == "model_choose":
+            # Spin up the provider-selection card as a NEW message (the main
+            # menu card is not the card updating here).
+            await self._send_provider_card(chat_id, thread_id=thread_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        if action == "model_provider_back":
+            # Post a fresh provider-selection card. The WebSocket card-action
+            # path returns an empty ack (CARD frames are not replied-to with a
+            # replacement card in this SDK), so in-place card swaps do not work
+            # here — we send a new card instead.
+            try:
+                providers = await asyncio.to_thread(self._list_authenticated_providers)
+                await self._send_card_payload(
+                    chat_id,
+                    self._build_provider_card(providers, thread_id=thread_id),
+                    thread_id=thread_id,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] model_provider_back failed: %s", exc)
+                await self._send_card_payload(
+                    chat_id,
+                    self._build_model_card_error(str(exc), thread_id=thread_id),
+                    thread_id=thread_id,
+                )
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        if action == "model_provider":
+            provider_slug = str(action_value.get("provider", "") or "")
+            try:
+                models = await asyncio.to_thread(self._list_models_for_provider, provider_slug)
+                await self._send_card_payload(
+                    chat_id,
+                    self._build_model_list_card(provider_slug, models, thread_id=thread_id),
+                    thread_id=thread_id,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] model_provider listing failed for %s: %s", provider_slug, exc)
+                await self._send_card_payload(
+                    chat_id,
+                    self._build_model_card_error(str(exc), thread_id=thread_id),
+                    thread_id=thread_id,
+                )
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        # NOTE: ``model_select`` is intentionally NOT handled here. Switching a
+        # model must go through the agent pipeline (/model applies the switch to
+        # the live agent and persists it), so ``_handle_card_action_event``
+        # synthesizes a ``/model <provider>/<model>`` command for it instead of
+        # routing it into this card-only handler.
+
+        logger.warning("[Feishu] Unknown model-menu action %r", action)
+        return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+    # =========================================================================
+    # Per-chat serialization and typing indicator
+    # =========================================================================
+
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         """Per-chat asyncio.Lock for serial processing; LRU-bounded, never evicts a held lock if any is free."""
         lock = self._chat_locks.get(chat_id)

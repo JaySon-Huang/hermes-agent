@@ -571,6 +571,41 @@ class GatewaySlashCommandsMixin(
         reply = _execute("commands", args=event.get_command_args(), options={"page_size": page_size})
         return self._telegramized_command_reply(event, reply.text)
 
+    async def _handle_menu_command(self, event: MessageEvent) -> str:
+        """Handle /menu — post the Feishu interactive button menu card.
+
+        Only meaningful on Feishu: the card's button clicks are routed back via
+        ``_handle_card_action_event`` (synthetic commands). On any other
+        platform return a friendly pointer to the typed slash commands.
+        """
+        source = event.source
+        if source.platform != Platform.FEISHU:
+            return (
+                "The `/menu` interactive card is only available on Feishu. "
+                "Use the equivalent typed slash commands on this platform instead."
+            )
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return "Unable to send the menu card: missing chat id."
+        # Topic/thread awareness: in a Feishu topic (forum) message, source.thread_id
+        # holds the topic root message id; routing the card via metadata.thread_id
+        # makes it land INSIDE the topic instead of spawning a new top-level topic.
+        # Filter out the synthetic "thread_id == message_id" case (a session key,
+        # not a real topic) the same way _home_thread_from_source does.
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        message_id = str(getattr(source, "message_id", "") or "")
+        if thread_id and thread_id == message_id:
+            thread_id = ""
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or not hasattr(adapter, "send_menu_card"):
+            return "Unable to send the menu card: the Feishu adapter is not available."
+        try:
+            await adapter.send_menu_card(chat_id=chat_id, thread_id=thread_id or None)
+        except Exception as exc:
+            logger.exception("Failed to send Feishu menu card for chat %s: %s", chat_id, exc)
+            return f"Failed to send the menu card: {exc}"
+        return "🤖 Interactive menu card sent."
+
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
         from gateway.run import _home_target_env_var, _home_thread_env_var
